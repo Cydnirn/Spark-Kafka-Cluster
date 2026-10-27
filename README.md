@@ -8,6 +8,7 @@ Spark worker, one single-node Kafka broker, all on one Compose network.
 | `spark-master` | `apache/spark:4.1.3-scala2.13-java17-python3-ubuntu`    | standalone master, PySpark + Scala 2.13 | `7077`, `8080` (UI) |
 | `spark-worker` | same image                                             | one worker, 2 cores / 2 GB by default | `8081` (UI)         |
 | `kafka`        | `apache/kafka:4.3.2`                                   | single-node KRaft broker+controller   | `29092`             |
+| `jupyter`      | built from `jupyter/Dockerfile` (same Spark image)     | JupyterLab, PySpark driver in-container | `8888`            |
 | `spark-history`| same Spark image (`--profile tools`)                   | Spark History Server                  | `18080`             |
 | `kafka-ui`     | `kafbat/kafka-ui:v1.5.0` (`--profile tools`)           | browse topics/messages in a browser   | `8090`              |
 
@@ -15,21 +16,28 @@ Kafka 4.x has no ZooKeeper — the broker runs a single combined `broker,control
 node (KRaft). Both images publish `amd64` and `arm64`.
 
 ```
-docker-compose.yml            the stack
-.env                          versions, ports, worker size (compose reads it automatically)
+docker-compose.yml              the stack
+.env                            versions, ports, worker size (compose reads it automatically)
 spark/conf/spark-defaults.conf  global Spark settings, mounted into every Spark container
-examples/01_roundtrip.py      Spark writes 100 records to Kafka, reads them back
-examples/02_streaming.py      windowed counts from a topic into another topic
-scripts/smoke-test.sh         one-shot end-to-end verification
+jupyter/Dockerfile              JupyterLab image, built from the same Spark image
+examples/spark_kafka_demo.ipynb notebook: connect to the cluster, write/read Kafka
+examples/01_roundtrip.py        Spark writes 100 records to Kafka, reads them back
+examples/02_streaming.py        windowed counts from a topic into another topic
+scripts/smoke-test.sh           one-shot end-to-end verification
 ```
 
 ## Start
 
 ```bash
-docker compose up -d            # core cluster
+docker compose up -d                   # core cluster, includes building the Jupyter image
 docker compose --profile tools up -d   # + history server + Kafka UI
 docker compose ps
 ```
+
+The first `up` builds `jupyter/Dockerfile` (pip installs JupyterLab onto the Spark
+image): needs network and a minute or two. Skip it with
+`docker compose up -d spark-master spark-worker kafka` if you only want the cluster,
+and build it later with `docker compose build jupyter`.
 
 Podman works as a drop-in: `podman compose up -d` (needs `podman-compose`).
 
@@ -91,6 +99,38 @@ other users (mode `644`/`755`, which is what git gives you), and on SELinux host
 (Fedora/RHEL) the mounts carry `:z` so podman/docker can relabel them. Without `:z`
 Spark silently ignores its config: no event logs, default settings.
 
+## JupyterLab
+
+<http://localhost:8888> — no token, no password (see *About security*). Notebooks
+live in the `jupyter-work` volume; on first start `jupyter/start.sh` copies the
+example notebook there, and `examples/` is also mounted at `/opt/examples`.
+
+The driver runs in the notebook container, so `SparkSession.master` is the cluster
+master and the work lands on `spark-worker`:
+
+```python
+spark = (SparkSession.builder
+         .appName("jupyter-experiment")
+         .master("spark://spark-master:7077")
+         .getOrCreate())
+spark.read.format("kafka").option("kafka.bootstrap.servers", "kafka:19092").load()
+```
+
+Two details that make this work:
+
+* the image is built on the cluster's Spark image, so the client version matches the
+  master (a mismatch is rejected by the master);
+* `PYSPARK_SUBMIT_ARGS` on the container carries `--packages <connector>`, which is
+  the only way to get the Kafka data source into a notebook session *and* ship the
+  jars to the executors.
+
+`examples/spark_kafka_demo.ipynb` is a runnable walkthrough. Re-run it headlessly:
+
+```bash
+docker compose exec jupyter jupyter nbconvert --to notebook --execute \
+  --output /tmp/out.ipynb /opt/examples/spark_kafka_demo.ipynb
+```
+
 ## Submitting your own work
 
 Jobs go through `spark-master` (driver in that container) and the worker picks up
@@ -125,6 +165,7 @@ resolve the connector — Spark only parses that flag in `spark-submit`.
 | `SPARK_MASTER_UI_HOST_PORT` | `8080`  | host port for the master UI                    |
 | `SPARK_WORKER_UI_HOST_PORT` | `8081`  | host port for the worker UI                    |
 | `KAFKA_HOST_PORT`           | `29092` | host-side Kafka port                           |
+| `JUPYTER_HOST_PORT`         | `8888`  | host port for JupyterLab                       |
 | `SPARK_IMAGE` / `KAFKA_IMAGE` | pinned tags | swap versions in one place               |
 
 The ports above are host-side only; inside the Compose network the services always

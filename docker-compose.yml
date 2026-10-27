@@ -37,13 +37,14 @@ services:
       - sh
       - -c
       - >-
-        mkdir -p /vol/spark-events /vol/spark-ivy /vol/kafka &&
-        chown -R 185:185 /vol/spark-events /vol/spark-ivy &&
+        mkdir -p /vol/spark-events /vol/spark-ivy /vol/kafka /vol/jupyter &&
+        chown -R 185:185 /vol/spark-events /vol/spark-ivy /vol/jupyter &&
         chown -R 1000:1000 /vol/kafka
     volumes:
       - spark-events:/vol/spark-events
       - spark-ivy:/vol/spark-ivy
       - kafka-data:/vol/kafka
+      - jupyter-work:/vol/jupyter
     restart: "no"
 
   # --------------------------------------------------------------- Spark ----
@@ -142,6 +143,44 @@ services:
       start_period: 20s
     networks: [bigdata]
 
+  # ------------------------------------------------------------- Jupyter ----
+  # Built from the same Spark image as the cluster (see jupyter/Dockerfile) so
+  # driver, master and executors are the same version. Driver runs in this
+  # container, executors run on spark-worker.
+  jupyter:
+    build:
+      context: ./jupyter
+      args:
+        SPARK_IMAGE: ${SPARK_IMAGE:-apache/spark:4.1.3-scala2.13-java17-python3-ubuntu}
+    image: ${JUPYTER_IMAGE:-spark-kafka-jupyter:4.1.3}
+    hostname: jupyter
+    container_name: skc-jupyter
+    restart: unless-stopped
+    ports:
+      - "${JUPYTER_HOST_PORT:-8888}:8888"
+    environment:
+      # --packages here (rather than in the notebook code) is what makes the Kafka
+      # connector available to driver *and* executors; jars land in spark.jars.ivy
+      # (/tmp/spark-ivy), so the first run downloads and later runs reuse them.
+      PYSPARK_SUBMIT_ARGS: >-
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.13:${SPARK_CONNECTOR_VERSION:-4.1.3}
+        pyspark-shell
+      SPARK_CONF_DIR: /opt/spark/conf
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro,z
+      - ./examples:/opt/examples:ro,z
+      - jupyter-work:/opt/notebooks
+      - spark-events:/tmp/spark-events
+      - spark-ivy:/tmp/spark-ivy
+    depends_on:
+      init-dirs:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks: [bigdata]
+
   # ---------------------------------------------------- optional tooling ----
   spark-history:
     <<: *spark-common
@@ -181,3 +220,4 @@ volumes:
   kafka-data:
   spark-events:
   spark-ivy:
+  jupyter-work:

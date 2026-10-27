@@ -36,4 +36,9 @@ $COMPOSE exec -T spark-master /opt/spark/bin/spark-submit \
   --packages "$CONNECTOR" /opt/examples/01_roundtrip.py 2>/dev/null \
   | grep -E '^\[(write|read|ok)\]'
 
+step "jupyterlab -> spark (runs the demo notebook in a kernel)"
+$COMPOSE exec -T jupyter jupyter nbconvert --to notebook --execute \
+  --output-dir=/tmp --output=smoke.ipynb /opt/examples/spark_kafka_demo.ipynb >/dev/null \
+  && echo "demo notebook executed end to end"
+
 printf '\n\033[1msmoke test passed\033[0m\n'
