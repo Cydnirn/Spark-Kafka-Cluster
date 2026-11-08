@@ -6,8 +6,19 @@
 #   history       : Spark History Server      (profile: tools, UI 18080)
 #   kafka-ui      : Kafka UI (kafbat)         (profile: tools, UI 8090)
 #
-# Quick start:  docker compose up -d
-#   or on Podman: podman compose up -d
+# Profiles (see README, "Start"):
+#   master  : the whole stack — init-dirs, spark-master, spark-worker, kafka,
+#             jupyter, and the tools (history server, Kafka UI)
+#   worker  : init-dirs + spark-worker ONLY — for a second machine that should
+#             just add compute to a master running elsewhere
+#   tools   : history server + Kafka UI only
+# SPARK_MASTER_IP (.env) is the address the worker dials, so the same file works
+# on every node: leave it as spark-master on a single host, set it to the
+# master's LAN IP for a multi-host cluster.
+#
+# Quick start (single host):  docker compose --profile master up -d
+# Other node:                 docker compose --profile worker up -d
+# Podman:                     podman compose --profile master up -d
 # ---------------------------------------------------------------------------
 name: spark-kafka
 
@@ -16,6 +27,9 @@ x-spark-common: &spark-common
   restart: unless-stopped
   environment:
     SPARK_NO_DAEMONIZE: "true"
+    # Visible inside the containers so a manual spark-submit (or a shell) can
+    # use --master spark://$SPARK_MASTER_IP:7077 without hardcoding a host.
+    SPARK_MASTER_IP: ${SPARK_MASTER_IP:-spark-master}
   volumes:
     # :z asks SELinux hosts (Fedora/RHEL) to relabel the mount; harmless elsewhere
     - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro,z
@@ -33,6 +47,9 @@ services:
   init-dirs:
     image: ${BUSYBOX_IMAGE:-busybox:1.37}
     container_name: skc-init
+    # Both profiles need it: it prepares the volumes each profile mounts. A
+    # worker-only node creates the Kafka/Jupyter volumes too, empty and unused.
+    profiles: [master, worker]
     command:
       - sh
       - -c
@@ -50,11 +67,17 @@ services:
   # --------------------------------------------------------------- Spark ----
   spark-master:
     <<: *spark-common
+    profiles: [master]
     hostname: spark-master
     container_name: skc-spark-master
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.master.Master
+      # Deliberately the service name, not SPARK_MASTER_IP: Spark binds the
+      # --host value as well as advertising it, and the LAN IP belongs to the
+      # host machine, not to this container — pointing --host at it fails with
+      # "Cannot assign requested address" (verified). Workers do not care: they
+      # register over the connection they open to SPARK_MASTER_IP themselves.
       - --host
       - spark-master
       # container-internal ports stay fixed (the worker and the healthcheck rely
@@ -66,6 +89,12 @@ services:
     ports:
       - "${SPARK_MASTER_HOST_PORT:-7077}:7077"
       - "${SPARK_MASTER_UI_HOST_PORT:-8080}:8080"
+      # Driver rendezvous ports, published for LAN workers: executors on another
+      # machine connect back to the driver here (README: "Run a cluster across a
+      # LAN"). Idle unless a driver pins them with spark.driver.port /
+      # spark.blockManager.port.
+      - "${SPARK_DRIVER_PORT:-7078}:7078"
+      - "${SPARK_BLOCKMANAGER_PORT:-7079}:7079"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080' || exit 1"]
       interval: 10s
@@ -75,12 +104,17 @@ services:
 
   spark-worker:
     <<: *spark-common
+    # In both profiles: the master node runs a local worker too, and a second
+    # machine runs this service alone (--profile worker).
+    profiles: [master, worker]
     hostname: spark-worker
     container_name: skc-spark-worker
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.worker.Worker
-      - spark://spark-master:7077
+      # The master address is a .env knob, not the service name, so the same
+      # file joins a master on another host.
+      - spark://${SPARK_MASTER_IP:-spark-master}:7077
       - --webui-port
       - "8081"
       - --cores
@@ -92,8 +126,9 @@ services:
     depends_on:
       init-dirs:
         condition: service_completed_successfully
-      spark-master:
-        condition: service_healthy
+      # No dependency on spark-master on purpose: on a worker-only node that
+      # service is not in the profile, and Compose would still start it there.
+      # Spark workers retry registration, so ordering does not matter.
     environment:
       SPARK_NO_DAEMONIZE: "true"
       SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
@@ -102,6 +137,7 @@ services:
   # --------------------------------------------------------------- Kafka ----
   kafka:
     image: ${KAFKA_IMAGE:-apache/kafka:4.3.2}
+    profiles: [master]
     hostname: kafka
     container_name: skc-kafka
     restart: unless-stopped
@@ -153,6 +189,7 @@ services:
       args:
         SPARK_IMAGE: ${SPARK_IMAGE:-apache/spark:4.1.3-scala2.13-java17-python3-ubuntu}
     image: ${JUPYTER_IMAGE:-spark-kafka-jupyter:4.1.3}
+    profiles: [master]
     hostname: jupyter
     container_name: skc-jupyter
     restart: unless-stopped
@@ -184,7 +221,9 @@ services:
   # ---------------------------------------------------- optional tooling ----
   spark-history:
     <<: *spark-common
-    profiles: [tools]
+    # Also part of master: on the master node it is the node that owns the
+    # event-log volume. A worker-only node has no history server.
+    profiles: [tools, master]
     hostname: spark-history
     container_name: skc-spark-history
     command: ["/opt/spark/sbin/start-history-server.sh"]
@@ -198,7 +237,7 @@ services:
 
   kafka-ui:
     image: ${KAFKA_UI_IMAGE:-kafbat/kafka-ui:v1.5.0}
-    profiles: [tools]
+    profiles: [tools, master]
     container_name: skc-kafka-ui
     restart: unless-stopped
     ports:

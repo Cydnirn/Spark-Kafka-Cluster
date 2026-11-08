@@ -4,9 +4,13 @@
 #
 #   ./scripts/smoke-test.sh            # docker
 #   COMPOSE="podman compose" ./scripts/smoke-test.sh
+#   PROFILE=worker ./scripts/smoke-test.sh    # on a worker-only node
 set -euo pipefail
 
 COMPOSE=${COMPOSE:-docker compose}
+# Every service lives behind a profile now (master / worker / tools); name it so
+# `ps` shows the node's containers. PROFILE defaults to the full master node.
+COMPOSE="$COMPOSE --profile ${PROFILE:-master}"
 CONNECTOR=${CONNECTOR:-org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.3}
 cd "$(dirname "$0")/.."
 
