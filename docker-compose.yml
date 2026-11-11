@@ -1,10 +1,19 @@
 # Spark + Kafka experiment cluster
 # ---------------------------------------------------------------------------
-#   spark-master  : standalone Spark master (RPC 7077, UI 8080)
-#   spark-worker  : one standalone Spark worker (UI 8081)
-#   kafka         : single-node KRaft broker/controller (host listener 29092)
+#   spark-master  : standalone Spark master (host networking: RPC 7077, UI 8080)
+#   spark-worker  : one standalone Spark worker (host networking: UI 8081)
+#   kafka         : single-node KRaft broker/controller (host networking: 29092)
 #   history       : Spark History Server      (profile: tools, UI 18080)
 #   kafka-ui      : Kafka UI (kafbat)         (profile: tools, UI 8090)
+#
+# EVERY service runs with network_mode: host. Nothing is published, nothing is
+# NATed, and no Compose network exists: each container uses the machine's own
+# interfaces, so the ports below are the host's ports and are reachable from the
+# LAN as soon as the machine is. That is also why there is no `networks:` block —
+# Compose rejects network_mode: host together with networks, and a bridge would
+# only hide the addresses Spark and Kafka have to advertise.
+#   master 7077/8080 · worker 8081 · history 18080 · JupyterLab 8888 · Kafka
+#   29092 (raft 29093 on loopback) · Kafka UI 8090 · driver ports, ephemeral.
 #
 # Profiles (see README, "Start"):
 #   master  : the whole stack — init-dirs, spark-master, spark-worker, kafka,
@@ -12,9 +21,9 @@
 #   worker  : init-dirs + spark-worker ONLY — for a second machine that should
 #             just add compute to a master running elsewhere
 #   tools   : history server + Kafka UI only
-# SPARK_MASTER_IP (.env) is the address the worker dials, so the same file works
-# on every node: leave it as spark-master on a single host, set it to the
-# master's LAN IP for a multi-host cluster.
+# SPARK_MASTER_IP / SPARK_LOCAL_IP / KAFKA_ADVERTISE_HOST (.env) are the addresses
+# Spark and Kafka bind and advertise: `localhost` on a single host, the machine's
+# LAN IP for a cluster.
 #
 # Quick start (single host):  docker compose --profile master up -d
 # Other node:                 docker compose --profile worker up -d
@@ -25,11 +34,23 @@ name: spark-kafka
 x-spark-common: &spark-common
   image: ${SPARK_IMAGE:-apache/spark:4.1.3-scala2.13-java17-python3-ubuntu}
   restart: unless-stopped
+  # Spark binds the address it advertises, so give it the machine's own network
+  # namespace: the LAN IP is bindable, remote workers/drivers reach it without
+  # published ports, and a driver can bind the host's address directly.
+  network_mode: host
   environment:
     SPARK_NO_DAEMONIZE: "true"
-    # Visible inside the containers so a manual spark-submit (or a shell) can
-    # use --master spark://$SPARK_MASTER_IP:7077 without hardcoding a host.
-    SPARK_MASTER_IP: ${SPARK_MASTER_IP:-spark-master}
+    # Read by the commands below and by the example scripts (--master,
+    # kafka.bootstrap.servers), so every node agrees on two values.
+    SPARK_MASTER_IP: ${SPARK_MASTER_IP:-localhost}
+    SPARK_MASTER_PORT: ${SPARK_MASTER_PORT:-7077}
+    KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:-localhost:29092}
+    # Required with network_mode: host. Spark resolves its own identity through
+    # InetAddress.getLocalHost(), which needs the container hostname in
+    # /etc/hosts — with the host's namespace there is no such entry and startup
+    # dies with UnknownHostException. SPARK_LOCAL_IP short-circuits that lookup
+    # and is what the node advertises to the master as its own address.
+    SPARK_LOCAL_IP: ${SPARK_LOCAL_IP:-localhost}
   volumes:
     # :z asks SELinux hosts (Fedora/RHEL) to relabel the mount; harmless elsewhere
     - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro,z
@@ -39,7 +60,6 @@ x-spark-common: &spark-common
   depends_on:
     init-dirs:
       condition: service_completed_successfully
-  networks: [bigdata]
 
 services:
   # Fixes ownership of the shared volumes so the non-root Spark/Kafka users can
@@ -47,9 +67,12 @@ services:
   init-dirs:
     image: ${BUSYBOX_IMAGE:-busybox:1.37}
     container_name: skc-init
-    # Both profiles need it: it prepares the volumes each profile mounts. A
+    # Every profile needs it: it prepares the volumes that profile mounts. A
     # worker-only node creates the Kafka/Jupyter volumes too, empty and unused.
-    profiles: [master, worker]
+    profiles: [master, worker, tools]
+    # It only chowns volumes, so it needs no network at all — which also keeps
+    # Compose from inventing a default bridge network nobody else uses.
+    network_mode: none
     command:
       - sh
       - -c
@@ -73,30 +96,19 @@ services:
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.master.Master
-      # Deliberately the service name, not SPARK_MASTER_IP: Spark binds the
-      # --host value as well as advertising it, and the LAN IP belongs to the
-      # host machine, not to this container — pointing --host at it fails with
-      # "Cannot assign requested address" (verified). Workers do not care: they
-      # register over the connection they open to SPARK_MASTER_IP themselves.
+      # --host is both the bind address and the address advertised to workers and
+      # drivers. Thanks to network_mode: host it can be the machine's LAN IP, so
+      # other machines reach the master directly; `localhost` (the default) keeps
+      # a single host private.
       - --host
-      - spark-master
-      # container-internal ports stay fixed (the worker and the healthcheck rely
-      # on 7077/8080); only the host-side mapping below is configurable
+      - ${SPARK_MASTER_IP:-localhost}
       - --port
-      - "7077"
+      - ${SPARK_MASTER_PORT:-7077}
       - --webui-port
-      - "8080"
-    ports:
-      - "${SPARK_MASTER_HOST_PORT:-7077}:7077"
-      - "${SPARK_MASTER_UI_HOST_PORT:-8080}:8080"
-      # Driver rendezvous ports, published for LAN workers: executors on another
-      # machine connect back to the driver here (README: "Run a cluster across a
-      # LAN"). Idle unless a driver pins them with spark.driver.port /
-      # spark.blockManager.port.
-      - "${SPARK_DRIVER_PORT:-7078}:7078"
-      - "${SPARK_BLOCKMANAGER_PORT:-7079}:7079"
+      - ${SPARK_MASTER_UI_PORT:-8080}
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080' || exit 1"]
+      # The UI binds SPARK_MASTER_IP too (not 0.0.0.0), so probe that address.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/${SPARK_MASTER_IP:-localhost}/${SPARK_MASTER_UI_PORT:-8080}' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -112,17 +124,15 @@ services:
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.worker.Worker
-      # The master address is a .env knob, not the service name, so the same
-      # file joins a master on another host.
-      - spark://${SPARK_MASTER_IP:-spark-master}:7077
+      # Same .env value as the master: on another machine it is that machine's
+      # LAN IP, so `--profile worker` alone joins the cluster.
+      - spark://${SPARK_MASTER_IP:-localhost}:${SPARK_MASTER_PORT:-7077}
       - --webui-port
-      - "8081"
+      - ${SPARK_WORKER_UI_PORT:-8081}
       - --cores
       - "${SPARK_WORKER_CORES:-2}"
       - --memory
       - "${SPARK_WORKER_MEMORY:-2g}"
-    ports:
-      - "${SPARK_WORKER_UI_HOST_PORT:-8081}:8081"
     depends_on:
       init-dirs:
         condition: service_completed_successfully
@@ -131,6 +141,10 @@ services:
       # Spark workers retry registration, so ordering does not matter.
     environment:
       SPARK_NO_DAEMONIZE: "true"
+      SPARK_MASTER_IP: ${SPARK_MASTER_IP:-localhost}
+      SPARK_MASTER_PORT: ${SPARK_MASTER_PORT:-7077}
+      SPARK_LOCAL_IP: ${SPARK_LOCAL_IP:-localhost}
+      KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:-localhost:29092}
       SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
       SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
 
@@ -141,20 +155,24 @@ services:
     hostname: kafka
     container_name: skc-kafka
     restart: unless-stopped
-    ports:
-      # host clients (CLI, IDE, python) -> localhost:29092
-      - "${KAFKA_HOST_PORT:-29092}:29092"
+    # Host networking like the Spark services: the broker listens on the
+    # machine's own interfaces, so there is no listener/port publishing split and
+    # LAN clients reach it at the address in KAFKA_ADVERTISE_HOST.
+    network_mode: host
     environment:
       CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      # CONTROLLER = raft quorum, PLAINTEXT = in-cluster (spark), PLAINTEXT_HOST = host
-      KAFKA_LISTENERS: CONTROLLER://kafka:29093,PLAINTEXT://0.0.0.0:19092,PLAINTEXT_HOST://0.0.0.0:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:${KAFKA_HOST_PORT:-29092}
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # Two listeners left: the raft quorum (loopback only, never advertised) and
+      # the broker itself. One broker listener is enough now that Spark and the
+      # host share a network namespace — no more "kafka:19092 inside,
+      # localhost:29092 outside".
+      KAFKA_LISTENERS: CONTROLLER://127.0.0.1:29093,PLAINTEXT://0.0.0.0:${KAFKA_PORT:-29092}
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${KAFKA_ADVERTISE_HOST:-localhost}:${KAFKA_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@127.0.0.1:29093
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       # single broker => replication factor 1 everywhere
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -172,17 +190,18 @@ services:
       init-dirs:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:${KAFKA_PORT:-29092} >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 12
       start_period: 20s
-    networks: [bigdata]
 
   # ------------------------------------------------------------- Jupyter ----
   # Built from the same Spark image as the cluster (see jupyter/Dockerfile) so
   # driver, master and executors are the same version. Driver runs in this
-  # container, executors run on spark-worker.
+  # container, executors run on the workers. Host networking for the same reason
+  # as the master: the driver has to be reachable from executors on other
+  # machines, and JupyterLab lands on the host's :8888 without a port mapping.
   jupyter:
     build:
       context: ./jupyter
@@ -193,16 +212,24 @@ services:
     hostname: jupyter
     container_name: skc-jupyter
     restart: unless-stopped
-    ports:
-      - "${JUPYTER_HOST_PORT:-8888}:8888"
+    network_mode: host
     environment:
       # --packages here (rather than in the notebook code) is what makes the Kafka
       # connector available to driver *and* executors; jars land in spark.jars.ivy
       # (/tmp/spark-ivy), so the first run downloads and later runs reuse them.
+      # --master/--conf spark.driver.host follow SPARK_MASTER_IP so notebooks need
+      # no .master(...) call and their driver is reachable from other machines.
       PYSPARK_SUBMIT_ARGS: >-
+        --master spark://${SPARK_MASTER_IP:-localhost}:${SPARK_MASTER_PORT:-7077}
+        --conf spark.driver.host=${SPARK_MASTER_IP:-localhost}
         --packages org.apache.spark:spark-sql-kafka-0-10_2.13:${SPARK_CONNECTOR_VERSION:-4.1.3}
         pyspark-shell
       SPARK_CONF_DIR: /opt/spark/conf
+      SPARK_MASTER_IP: ${SPARK_MASTER_IP:-localhost}
+      SPARK_MASTER_PORT: ${SPARK_MASTER_PORT:-7077}
+      SPARK_MASTER_UI_PORT: ${SPARK_MASTER_UI_PORT:-8080}
+      SPARK_LOCAL_IP: ${SPARK_LOCAL_IP:-localhost}
+      KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:-localhost:29092}
     volumes:
       - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro,z
       - ./examples:/opt/examples:ro,z
@@ -216,7 +243,6 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-    networks: [bigdata]
 
   # ---------------------------------------------------- optional tooling ----
   spark-history:
@@ -229,31 +255,29 @@ services:
     command: ["/opt/spark/sbin/start-history-server.sh"]
     environment:
       SPARK_NO_DAEMONIZE: "true"
+      SPARK_LOCAL_IP: ${SPARK_LOCAL_IP:-localhost}
       SPARK_HISTORY_OPTS: >-
         -Dspark.history.fs.logDirectory=file:///tmp/spark-events
-        -Dspark.history.ui.port=18080
-    ports:
-      - "${SPARK_HISTORY_UI_HOST_PORT:-18080}:18080"
+        -Dspark.history.ui.port=${SPARK_HISTORY_UI_PORT:-18080}
 
   kafka-ui:
     image: ${KAFKA_UI_IMAGE:-kafbat/kafka-ui:v1.5.0}
     profiles: [tools, master]
     container_name: skc-kafka-ui
     restart: unless-stopped
-    ports:
-      - "${KAFKA_UI_PORT:-8090}:8080"
+    # Host networking too: it serves on the machine's own KAFKA_UI_PORT and talks
+    # to the broker over loopback.
+    network_mode: host
     environment:
+      # Kafka UI would otherwise take 8080 (Spring Boot's default), which the
+      # Spark master UI already owns.
+      SERVER_PORT: ${KAFKA_UI_PORT:-8090}
       KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: localhost:${KAFKA_PORT:-29092}
       DYNAMIC_CONFIG_ENABLED: "true"
     depends_on:
       kafka:
         condition: service_healthy
-    networks: [bigdata]
-
-networks:
-  bigdata:
-    name: spark-kafka-net
 
 volumes:
   kafka-data:

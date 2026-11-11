@@ -4,14 +4,21 @@
 Run it inside the Spark master container:
 
     docker compose exec spark-master /opt/spark/bin/spark-submit \
+        --master spark://$SPARK_MASTER_IP:$SPARK_MASTER_PORT \
         --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.3 \
         /opt/examples/01_roundtrip.py
 
-Adjust the connector version if you change SPARK_IMAGE in .env.
+$SPARK_MASTER_IP / $SPARK_MASTER_PORT / $KAFKA_BOOTSTRAP come from .env and are
+already set in the container. Adjust the connector version if you change
+SPARK_IMAGE in .env.
 """
+import os
+
 from pyspark.sql import SparkSession, functions as F
 
-BROKER = "kafka:19092"          # in-cluster PLAINTEXT listener
+# Every container shares the host's network namespace, so Kafka is simply at
+# localhost:29092 — there is no bridge network and no per-network listener.
+BROKER = os.environ.get("KAFKA_BOOTSTRAP", "localhost:29092")
 TOPIC = "demo-events"
 
 # The Kafka data source lives in the connector jar, which must be added by

@@ -3,23 +3,27 @@
 write the result to the demo-aggregates topic.
 
     docker compose exec spark-master /opt/spark/bin/spark-submit \
+        --master spark://$SPARK_MASTER_IP:$SPARK_MASTER_PORT \
         --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.3 \
         /opt/examples/02_streaming.py
 
 While it runs, produce data from the host:
 
     docker compose exec kafka /opt/kafka/bin/kafka-console-producer.sh \
-        --bootstrap-server localhost:19092 --topic demo-events
+        --bootstrap-server localhost:29092 --topic demo-events
     # type lines like {"event_id":1,"user":1,"type":"click"}, Ctrl-D to stop
 
 Then watch the output topic:
 
     docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
-        --bootstrap-server localhost:19092 --topic demo-aggregates --from-beginning
+        --bootstrap-server localhost:29092 --topic demo-aggregates --from-beginning
 """
+import os
+
 from pyspark.sql import SparkSession, functions as F
 
-BROKER = "kafka:19092"
+# Host listener again: the Spark containers run in the host's network namespace.
+BROKER = os.environ.get("KAFKA_BOOTSTRAP", "localhost:29092")
 IN_TOPIC = "demo-events"
 OUT_TOPIC = "demo-aggregates"
 
