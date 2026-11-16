@@ -93,6 +93,13 @@ services:
     profiles: [master]
     hostname: spark-master
     container_name: skc-spark-master
+    # Every JVM resolves its own hostname at startup (log4j's NetUtils, plus
+    # Spark's InetAddress.getLocalHost fallback). With host networking there is no
+    # /etc/hosts entry for the container hostname, so without this line startup
+    # blocks on the machine's resolver — fatal when DNS is unreachable (VPN
+    # resolver pinned but offline, etc.). SPARK_LOCAL_IP only covers Spark itself.
+    extra_hosts:
+      - "spark-master:127.0.0.1"
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.master.Master
@@ -121,6 +128,8 @@ services:
     profiles: [master, worker]
     hostname: spark-worker
     container_name: skc-spark-worker
+    extra_hosts:
+      - "spark-worker:127.0.0.1"
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.worker.Worker
@@ -154,6 +163,8 @@ services:
     profiles: [master]
     hostname: kafka
     container_name: skc-kafka
+    extra_hosts:
+      - "kafka:127.0.0.1"
     restart: unless-stopped
     # Host networking like the Spark services: the broker listens on the
     # machine's own interfaces, so there is no listener/port publishing split and
@@ -211,6 +222,8 @@ services:
     profiles: [master]
     hostname: jupyter
     container_name: skc-jupyter
+    extra_hosts:
+      - "jupyter:127.0.0.1"
     restart: unless-stopped
     network_mode: host
     environment:
@@ -252,6 +265,8 @@ services:
     profiles: [tools, master]
     hostname: spark-history
     container_name: skc-spark-history
+    extra_hosts:
+      - "spark-history:127.0.0.1"
     command: ["/opt/spark/sbin/start-history-server.sh"]
     environment:
       SPARK_NO_DAEMONIZE: "true"
@@ -264,6 +279,9 @@ services:
     image: ${KAFKA_UI_IMAGE:-kafbat/kafka-ui:v1.5.0}
     profiles: [tools, master]
     container_name: skc-kafka-ui
+    hostname: kafka-ui
+    extra_hosts:
+      - "kafka-ui:127.0.0.1"
     restart: unless-stopped
     # Host networking too: it serves on the machine's own KAFKA_UI_PORT and talks
     # to the broker over loopback.
