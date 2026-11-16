@@ -278,6 +278,7 @@ resolve the connector — Spark only parses that flag in `spark-submit`.
 | `KAFKA_BOOTSTRAP`           | `localhost:29092` | where Spark jobs and examples look for Kafka |
 | `SPARK_HISTORY_UI_PORT`     | `18080` | history server UI                              |
 | `KAFKA_UI_PORT`             | `8090`  | Kafka UI (in-container port, on the host now)  |
+| `CONTAINER_DNS`             | `1.1.1.1` | resolver the containers use (override for VPN DNS) |
 | `SPARK_IMAGE` / `KAFKA_IMAGE` | pinned tags | swap versions in one place               |
 
 Every port above is the machine's own — host networking, nothing remapped — so
@@ -326,6 +327,15 @@ than expecting Compose to.
   `BUSYBOX_IMAGE`, `JUPYTER_IMAGE` base) in `.env`, or add
   `unqualified-search-registries = ["docker.io"]` under `[registries.search]` in
   `/etc/containers/registries.conf`.
+- **`up` hangs, or containers sit `(starting)` / `(unhealthy)` for minutes** — the
+  containers inherit the host's `/etc/resolv.conf`, and a VPN-owned resolver
+  (Tailscale MagicDNS `100.100.100.100`, systemd-resolved on a VPN link) is usually
+  unreachable from inside a rootless host-net container. Every JVM then stalls in
+  `InetAddress.getLocalHost()` during log4j init, the Kafka healthcheck times out, and
+  `podman wait --condition=healthy` never returns. Each service now gets an
+  `/etc/hosts` entry for its own hostname (so no lookup is needed) and
+  `CONTAINER_DNS` points them at a reachable resolver. If you change it, keep it to an
+  address the containers can actually reach.
 - **podman-compose leaves a container in `Created` with `container state improper`** —
   its dependency engine races with the one-shot `init-dirs` container (jupyter is the
   usual victim). Re-run the same `up -d`, or `podman start skc-jupyter`; Docker Compose

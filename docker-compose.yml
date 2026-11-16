@@ -38,6 +38,13 @@ x-spark-common: &spark-common
   # namespace: the LAN IP is bindable, remote workers/drivers reach it without
   # published ports, and a driver can bind the host's address directly.
   network_mode: host
+  # Host-networked containers inherit the host's /etc/resolv.conf. If the host
+  # resolves through a VPN sidecar (Tailscale MagicDNS 100.100.100.100,
+  # systemd-resolved on a VPN link) that the container cannot reach, every name
+  # lookup stalls for the resolver timeout — JVMs freeze in startup and
+  # `--packages` cannot fetch from Maven. Give them a resolver they can use;
+  # override with CONTAINER_DNS in .env.
+  dns: ["${CONTAINER_DNS:-1.1.1.1}"]
   environment:
     SPARK_NO_DAEMONIZE: "true"
     # Read by the commands below and by the example scripts (--master,
@@ -165,6 +172,7 @@ services:
     container_name: skc-kafka
     extra_hosts:
       - "kafka:127.0.0.1"
+    dns: ["${CONTAINER_DNS:-1.1.1.1}"]
     restart: unless-stopped
     # Host networking like the Spark services: the broker listens on the
     # machine's own interfaces, so there is no listener/port publishing split and
@@ -224,6 +232,7 @@ services:
     container_name: skc-jupyter
     extra_hosts:
       - "jupyter:127.0.0.1"
+    dns: ["${CONTAINER_DNS:-1.1.1.1}"]
     restart: unless-stopped
     network_mode: host
     environment:
@@ -282,6 +291,7 @@ services:
     hostname: kafka-ui
     extra_hosts:
       - "kafka-ui:127.0.0.1"
+    dns: ["${CONTAINER_DNS:-1.1.1.1}"]
     restart: unless-stopped
     # Host networking too: it serves on the machine's own KAFKA_UI_PORT and talks
     # to the broker over loopback.
