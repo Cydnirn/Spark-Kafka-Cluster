@@ -362,3 +362,8 @@ than expecting Compose to.
   image is Scala 2.13, so connector artifacts must end in `_2.13`.
 - **Kafka restarts in a loop after changing `KAFKA_CLUSTER_ID`** — the existing
   volume was formatted with the old id; `docker compose down -v` to reformat.
+
+
+## Disclaimer
+
+There is a problem for Mac OS and Windows when running this compose setup. Mac OS and Windows cannot use host networking, so the `host` network driver is not available. Use `bridge` or `overlay` instead.
